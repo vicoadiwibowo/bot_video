@@ -36,7 +36,6 @@ cd "$INSTALL_DIR"
 say "Install library Python"
 export AIOHTTP_NO_EXTENSIONS=1 FROZENLIST_NO_EXTENSIONS=1 \
        MULTIDICT_NO_EXTENSIONS=1 YARL_NO_EXTENSIONS=1
-pip install --upgrade pip
 pip install -r requirements.txt
 pip install curl_cffi || echo "(curl_cffi gagal dipasang — hanya perlu untuk host surrit, boleh diabaikan)"
 
