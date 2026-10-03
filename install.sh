@@ -944,6 +944,7 @@ def remux_to_mp4(src, dst):
 
 
 # ====== MAGNET / TORRENT (aria2) ======
+BT_VIDEO_EXTS = VIDEO_EXTS + (".wmv", ".mpg", ".mpeg", ".m2ts", ".3gp", ".vob", ".ogv")
 _SIZE_UNITS = {"B": 1, "KIB": 1024, "MIB": 1024 ** 2, "GIB": 1024 ** 3, "TIB": 1024 ** 4}
 BT_PROG_RE = re.compile(r"\[#\w+\s+([\d.]+[KMGT]?i?B)/([\d.]+[KMGT]?i?B)\((\d+)%\)([^\]]*)\]", re.I)
 
@@ -1080,9 +1081,11 @@ async def process_torrent(src, status_msg, job_dir):
             f.write(body)
 
     files = await asyncio.to_thread(bt_list_files, torrent)
-    vids = [f for f in files if f[1].lower().endswith(VIDEO_EXTS)]
+    vids = [f for f in files if f[1].lower().endswith(BT_VIDEO_EXTS)]
     if files and not vids:
-        raise DownloadError("torrent tidak berisi file video")
+        top = sorted(files, key=lambda f: -f[2])[:4]
+        listing = "; ".join(f"{os.path.basename(p)[:40]} ({human_size(sz)})" for _, p, sz in top)
+        raise DownloadError(f"torrent tidak berisi file video ({len(files)} file). Terbesar: {listing}")
 
     selected = None
     if vids:
@@ -1106,7 +1109,7 @@ async def process_torrent(src, status_msg, job_dir):
         best = None
         for root, _, names in os.walk(dl_dir):
             for n in names:
-                if n.lower().endswith(VIDEO_EXTS):
+                if n.lower().endswith(BT_VIDEO_EXTS):
                     p = os.path.join(root, n)
                     sz = os.path.getsize(p)
                     if not best or sz > best[1]:
