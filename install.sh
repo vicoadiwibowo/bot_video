@@ -1192,26 +1192,72 @@ python -c "import telegram, aiohttp" 2>/dev/null \
     || die "Library terpasang tapi gagal di-import. Jalankan: python -c 'import telegram, aiohttp'"
 
 # ---------- 5. Konfigurasi ----------
+env_set() {  # env_set KEY VALUE
+    if grep -q "^$1=" .env 2>/dev/null; then
+        sed -i "s|^$1=.*|$1=$2|" .env
+    else
+        echo "$1=$2" >> .env
+    fi
+}
+
+ask_valid() {  # ask_valid "pertanyaan" "regex" "pesan error"
+    local v=""
+    while true; do
+        v="$(ask "$1" "")"
+        if [[ "$v" =~ $2 ]]; then echo "$v"; return; fi
+        warn "$3" >&2
+    done
+}
+
 if [ -f .env ] && grep -q '^BOT_TOKEN=.\+' .env && grep -q '^CHANNEL_ID=.\+' .env; then
-    say ".env sudah lengkap - tidak ditimpa"
+    say ".env dasar sudah lengkap - tidak ditimpa"
 else
     say "Konfigurasi bot"
     BOT_TOKEN="$(ask_required 'BOT_TOKEN (dari @BotFather):')"
     CHANNEL_ID="$(ask_required 'CHANNEL_ID (contoh -1001234567890):')"
     ALLOWED_USERS="$(ask_required 'ALLOWED_USERS (ID Telegram kamu, pisah koma):')"
-    LOCAL="$(ask 'Pakai Local Bot API server (upload sampai 2GB)? [y/N]:' 'n')"
-    API_HOST=""
-    case "$LOCAL" in
-        y|Y) API_HOST="$(ask 'API_HOST [http://127.0.0.1:8081]:' 'http://127.0.0.1:8081')" ;;
-    esac
     cat > .env <<EOF
 BOT_TOKEN=$BOT_TOKEN
 CHANNEL_ID=$CHANNEL_ID
 ALLOWED_USERS=$ALLOWED_USERS
-API_HOST=$API_HOST
+API_HOST=
 DOWNLOAD_DIR=$DL_DIR
 EOF
     chmod 600 .env
+fi
+
+# ---------- 5b. Local Bot API server (opsional, upload sampai 2GB) ----------
+if ! grep -q '^LOCAL_API=' .env; then
+    say "Local Bot API server"
+    LOCAL="$(ask 'Pakai Local Bot API server (upload sampai 2GB)? [y/N]:' 'n')"
+    case "$LOCAL" in
+        y|Y)
+            if ! command -v telegram-bot-api >/dev/null 2>&1; then
+                retry 2 pkg install -y telegram-bot-api </dev/null || true
+            fi
+            if ! command -v telegram-bot-api >/dev/null 2>&1; then
+                warn "Paket telegram-bot-api tidak tersedia di Termux Anda. Bot dipakai tanpa server lokal (batas ~50MB)."
+                warn "Pasang telegram-bot-api manual, lalu hapus baris LOCAL_API dari .env dan jalankan ulang installer."
+                env_set LOCAL_API 0
+                env_set API_HOST ""
+            else
+                echo "Ambil api_id dan api_hash di https://my.telegram.org (API development tools)."
+                TG_API_ID="$(ask_valid 'api_id (angka):' '^[0-9]{3,12}$' 'api_id harus berupa angka.')"
+                TG_API_HASH="$(ask_valid 'api_hash:' '^[0-9A-Za-z_-]+$' 'api_hash tidak boleh kosong dan hanya huruf/angka.')"
+                env_set TG_API_ID "$TG_API_ID"
+                env_set TG_API_HASH "$TG_API_HASH"
+                env_set API_HOST "http://127.0.0.1:8081"
+                env_set LOCAL_API 1
+                say "Local Bot API aktif - akan dijalankan otomatis oleh start.sh"
+            fi
+            ;;
+        *)
+            env_set LOCAL_API 0
+            env_set API_HOST ""
+            ;;
+    esac
+else
+    say "Pengaturan Local Bot API sudah ada di .env"
 fi
 
 # ---------- 6. Script start ----------
@@ -1222,7 +1268,45 @@ if ! grep -q '^BOT_TOKEN=.\+' .env 2>/dev/null || ! grep -q '^CHANNEL_ID=.\+' .e
     echo "File .env belum lengkap. Edit dulu: nano .env"
     exit 1
 fi
+set -a; . ./.env; set +a
 termux-wake-lock 2>/dev/null || true
+
+TG_PID=""
+cleanup() { [ -n "$TG_PID" ] && kill "$TG_PID" 2>/dev/null; }
+trap 'cleanup; exit 0' INT TERM
+trap cleanup EXIT
+
+port_open() { (echo > /dev/tcp/127.0.0.1/8081) >/dev/null 2>&1; }
+
+if [ "${LOCAL_API:-0}" = "1" ]; then
+    if port_open; then
+        echo "Local Bot API sudah berjalan di port 8081."
+    else
+        if ! command -v telegram-bot-api >/dev/null 2>&1; then
+            echo "telegram-bot-api tidak ditemukan. Pasang dulu atau set LOCAL_API=0 di .env"
+            exit 1
+        fi
+        mkdir -p "$HOME/.tg-bot-api/data" "$HOME/.tg-bot-api/tmp"
+        echo "Menjalankan Local Bot API server..."
+        telegram-bot-api --api-id="$TG_API_ID" --api-hash="$TG_API_HASH" \
+            --local --http-port=8081 \
+            --dir="$HOME/.tg-bot-api/data" --temp-dir="$HOME/.tg-bot-api/tmp" \
+            >"$HOME/.tg-bot-api/server.log" 2>&1 &
+        TG_PID=$!
+        for _ in $(seq 1 30); do
+            port_open && break
+            kill -0 "$TG_PID" 2>/dev/null || break
+            sleep 1
+        done
+        if ! port_open; then
+            echo "Local Bot API gagal start. Log: $HOME/.tg-bot-api/server.log"
+            tail -n 5 "$HOME/.tg-bot-api/server.log" 2>/dev/null
+            exit 1
+        fi
+        echo "Local Bot API aktif di port 8081."
+    fi
+fi
+
 while true; do
     python bot.py
     echo "Bot berhenti, restart 5 detik... (Ctrl+C untuk keluar)"
