@@ -46,8 +46,11 @@ ask_required() {
 
 main() {
 # ---------- 1. Paket Termux ----------
-say "Update paket Termux"
+say "Update & upgrade paket Termux"
+dpkg --configure -a </dev/null >/dev/null 2>&1 || true
 retry 3 pkg update -y -o Dpkg::Options::="--force-confold" </dev/null || warn "pkg update gagal, lanjut dengan data lama"
+retry 3 pkg upgrade -y -o Dpkg::Options::="--force-confold" </dev/null || warn "pkg upgrade gagal, lanjut"
+dpkg --configure -a </dev/null >/dev/null 2>&1 || true
 retry 3 pkg install -y -o Dpkg::Options::="--force-confold" \
     python ffmpeg clang libffi openssl </dev/null \
     || die "Gagal memasang paket Termux. Cek koneksi lalu jalankan ulang."
