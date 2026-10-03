@@ -1,12 +1,12 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # video_bot installer untuk Termux
-# Pakai:  curl -fsSL https://raw.githubusercontent.com/USERNAME/video_bot/main/install.sh | bash
+# Pakai:  curl -fsSL https://raw.githubusercontent.com/vicoadiwibowo/bot_video/main/install.sh | bash
 # Jalankan lagi kapan saja untuk update (file .env tidak ditimpa).
 
 set -e
 
-REPO_URL="${REPO_URL:-https://github.com/USERNAME/video_bot.git}"
-INSTALL_DIR="${INSTALL_DIR:-$HOME/video_bot}"
+REPO_URL="${REPO_URL:-https://github.com/vicoadiwibowo/bot_video.git}"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/bot_video}"
 
 say() { printf '\n\033[1;32m==> %s\033[0m\n' "$1"; }
 ask() {  # ask "pertanyaan" "default" -> echo jawaban
@@ -37,7 +37,7 @@ say "Install library Python"
 export AIOHTTP_NO_EXTENSIONS=1 FROZENLIST_NO_EXTENSIONS=1 \
        MULTIDICT_NO_EXTENSIONS=1 YARL_NO_EXTENSIONS=1
 pip install -r requirements.txt
-pip install curl_cffi || echo "(curl_cffi gagal dipasang — hanya perlu untuk host surrit, boleh diabaikan)"
+pip install curl_cffi || echo "(curl_cffi gagal dipasang - hanya perlu untuk host surrit, boleh diabaikan)"
 
 if [ ! -f .env ]; then
     say "Konfigurasi bot"
@@ -57,7 +57,7 @@ API_HOST=$API_HOST
 EOF
     chmod 600 .env
 else
-    say ".env sudah ada — tidak ditimpa"
+    say ".env sudah ada - tidak ditimpa"
 fi
 
 cat > start.sh <<'EOF'
@@ -73,6 +73,5 @@ EOF
 chmod +x start.sh
 
 say "Selesai!"
-echo "Jalankan bot:   cd $INSTALL_DIR && ./start.sh"
+echo "Jalankan bot:     cd $INSTALL_DIR && ./start.sh"
 echo "Edit konfigurasi: nano $INSTALL_DIR/.env"
-echo "(Kalau .env masih kosong, isi dulu: BOT_TOKEN, CHANNEL_ID, ALLOWED_USERS)"
