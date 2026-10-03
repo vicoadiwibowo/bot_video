@@ -52,7 +52,7 @@ retry 3 pkg update -y -o Dpkg::Options::="--force-confold" </dev/null || warn "p
 retry 3 pkg upgrade -y -o Dpkg::Options::="--force-confold" </dev/null || warn "pkg upgrade gagal, lanjut"
 dpkg --configure -a </dev/null >/dev/null 2>&1 || true
 retry 3 pkg install -y -o Dpkg::Options::="--force-confold" \
-    python ffmpeg clang libffi openssl </dev/null \
+    python ffmpeg aria2 clang libffi openssl </dev/null \
     || die "Gagal memasang paket Termux. Cek koneksi lalu jalankan ulang."
 
 # ---------- 2. Storage ----------
@@ -78,9 +78,10 @@ cd "$INSTALL_DIR" || die "Folder $INSTALL_DIR tidak ditemukan."
 cat > bot.py <<'PYEOF'
 #!/usr/bin/env python3
 """
-video_bot v4 — Telegram bot: link video -> download -> upload ke channel.
+video_bot v5 — Telegram bot: link video -> download -> upload ke channel.
 Support: direct file (multipart), HLS (segmen paralel, disimpan ke disk),
-DASH (ffmpeg), dan pencarian URL video di halaman HTML/JSON.
+DASH (ffmpeg), pencarian URL video di halaman HTML/JSON,
+dan magnet / .torrent (via aria2, hanya file video terbesar yang diunduh).
 """
 import asyncio
 import html as htmllib
@@ -161,6 +162,15 @@ MAX_CANDIDATES = 3
 MAX_TEXT_BYTES = 3 * 1024 * 1024
 HLS_TIMEOUT = 7200
 MAX_JOBS = int(os.environ.get("MAX_JOBS", "1"))
+METADATA_TIMEOUT = int(os.environ.get("METADATA_TIMEOUT", "180"))
+BT_STALL_TIMEOUT = int(os.environ.get("BT_STALL_TIMEOUT", "600"))
+BT_TIMEOUT = int(os.environ.get("BT_TIMEOUT", "14400"))
+BT_TRACKERS = os.environ.get("BT_TRACKERS", ",".join([
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://exodus.desync.com:6969/announce",
+]))
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 "
@@ -933,6 +943,180 @@ def remux_to_mp4(src, dst):
     return r.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0
 
 
+# ====== MAGNET / TORRENT (aria2) ======
+_SIZE_UNITS = {"B": 1, "KIB": 1024, "MIB": 1024 ** 2, "GIB": 1024 ** 3, "TIB": 1024 ** 4}
+BT_PROG_RE = re.compile(r"\[#\w+\s+([\d.]+[KMGT]?i?B)/([\d.]+[KMGT]?i?B)\((\d+)%\)([^\]]*)\]", re.I)
+
+
+def parse_size(s):
+    m = re.fullmatch(r"([\d.]+)\s*([KMGT]?i?B)", s.strip(), re.I)
+    if not m:
+        return 0
+    return int(float(m.group(1)) * _SIZE_UNITS[m.group(2).upper()])
+
+
+def is_torrent_src(url):
+    return url.lower().startswith("magnet:") or urlparse(url).path.lower().endswith(".torrent")
+
+
+def _aria_base(dest_dir):
+    args = ["aria2c", "--dir", dest_dir,
+            "--seed-time=0", "--seed-ratio=0.0", "--file-allocation=none",
+            "--console-log-level=error", "--download-result=hide",
+            "--enable-color=false", "--bt-enable-lpd=true",
+            "--bt-max-peers=100", "--allow-overwrite=true"]
+    if BT_TRACKERS:
+        args.append(f"--bt-tracker={BT_TRACKERS}")
+    return args
+
+
+async def bt_get_metadata(magnet, meta_dir):
+    cmd = _aria_base(meta_dir) + ["--bt-metadata-only=true", "--bt-save-metadata=true",
+                                  "--summary-interval=0", magnet]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        await asyncio.wait_for(proc.wait(), METADATA_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise DownloadError("metadata magnet tidak didapat (tidak ada peer / tracker mati)")
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+    found = [f for f in os.listdir(meta_dir) if f.endswith(".torrent")]
+    if not found:
+        raise DownloadError("gagal mengambil metadata torrent")
+    return os.path.join(meta_dir, found[0])
+
+
+def bt_list_files(torrent):
+    """Return [(index, path, size_bytes)] dari output `aria2c -S`."""
+    try:
+        r = subprocess.run(["aria2c", "-S", torrent], capture_output=True, text=True, timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    lines = r.stdout.splitlines()
+    files = []
+    for i, line in enumerate(lines[:-1]):
+        m = re.match(r"^\s*(\d+)\|(.+)$", line)
+        if not m:
+            continue
+        m2 = re.match(r"^\s*\|\s*[\d.]+\s*[KMGT]?i?B\s*\(([\d,]+)\)", lines[i + 1], re.I)
+        if m2:
+            files.append((int(m.group(1)), m.group(2).strip(), int(m2.group(1).replace(",", ""))))
+    return files
+
+
+async def bt_download(src, dest_dir, status_msg, select_idx=None, expect_total=0):
+    cmd = _aria_base(dest_dir) + ["--summary-interval=1"]
+    if select_idx:
+        cmd.append(f"--select-file={select_idx}")
+    cmd.append(src)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    progress = Progress(status_msg, expect_total, label="Torrent")
+    await progress.update(0, force=True)
+    buf, last_done = "", 0
+    start = last_move = time.monotonic()
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(proc.stdout.read(4096), 5)
+            except asyncio.TimeoutError:
+                chunk = None
+            if chunk == b"":
+                break
+            now = time.monotonic()
+            if chunk:
+                buf = (buf + chunk.decode("utf-8", "ignore"))[-4000:]
+                ms = list(BT_PROG_RE.finditer(buf))
+                if ms:
+                    done, total = parse_size(ms[-1].group(1)), parse_size(ms[-1].group(2))
+                    if total:
+                        progress.total = total
+                        if total > MAX_BYTES:
+                            raise TooBig(f"file {human_size(total)} > {MAX_SIZE_MB}MB")
+                    await progress.update(done)
+                    if done > last_done:
+                        last_done, last_move = done, now
+            if now - last_move > BT_STALL_TIMEOUT:
+                raise DownloadError("torrent tidak ada kemajuan (seeder habis?)")
+            if now - start > BT_TIMEOUT:
+                raise DownloadError("torrent melewati batas waktu")
+        await proc.wait()
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+    if proc.returncode != 0:
+        raise DownloadError(f"aria2 gagal (kode {proc.returncode})")
+    await progress.update(progress.total or last_done, force=True)
+
+
+async def process_torrent(src, status_msg, job_dir):
+    if not shutil.which("aria2c"):
+        raise DownloadError("aria2 belum terpasang (jalankan: pkg install aria2)")
+    meta_dir = os.path.join(job_dir, "meta")
+    dl_dir = os.path.join(job_dir, "bt")
+    os.makedirs(meta_dir, exist_ok=True)
+    os.makedirs(dl_dir, exist_ok=True)
+
+    if src.lower().startswith("magnet:"):
+        if "xt=urn:bt" not in src.lower():
+            raise DownloadError("link magnet tidak valid")
+        await safe_edit(status_msg, "Magnet: mengambil metadata...")
+        torrent = await bt_get_metadata(src, meta_dir)
+    else:
+        if not ALLOW_PRIVATE_HOSTS and not await asyncio.to_thread(is_safe_url, src):
+            raise DownloadError("URL ke alamat lokal/privat diblokir")
+        await safe_edit(status_msg, "Mengunduh file .torrent...")
+        status, _, body = await fetch_bytes(src, timeout=60)
+        if status != 200 or not body:
+            raise DownloadError(f".torrent HTTP {status}")
+        torrent = os.path.join(meta_dir, "file.torrent")
+        with open(torrent, "wb") as f:
+            f.write(body)
+
+    files = await asyncio.to_thread(bt_list_files, torrent)
+    vids = [f for f in files if f[1].lower().endswith(VIDEO_EXTS)]
+    if files and not vids:
+        raise DownloadError("torrent tidak berisi file video")
+
+    selected = None
+    if vids:
+        idx, path, size = max(vids, key=lambda f: f[2])
+        if size > MAX_BYTES:
+            raise TooBig(f"file {human_size(size)} > {MAX_SIZE_MB}MB")
+        free = shutil.disk_usage(dl_dir).free
+        if free < size * 1.1:
+            raise DownloadError(f"disk kurang (butuh {human_size(size)}, sisa {human_size(free)})")
+        await safe_edit(status_msg, f"Torrent: {len(files)} file, mengunduh video terbesar ({human_size(size)})...")
+        await bt_download(torrent, dl_dir, status_msg, select_idx=idx, expect_total=size)
+        rel = path[2:] if path.startswith("./") else path
+        full = os.path.realpath(os.path.join(dl_dir, rel))
+        if full.startswith(os.path.realpath(dl_dir) + os.sep) and os.path.isfile(full):
+            selected = full
+    else:
+        await safe_edit(status_msg, "Torrent: mengunduh...")
+        await bt_download(torrent, dl_dir, status_msg)
+
+    if not selected:
+        best = None
+        for root, _, names in os.walk(dl_dir):
+            for n in names:
+                if n.lower().endswith(VIDEO_EXTS):
+                    p = os.path.join(root, n)
+                    sz = os.path.getsize(p)
+                    if not best or sz > best[1]:
+                        best = (p, sz)
+        if not best:
+            raise DownloadError("tidak ada file video hasil torrent")
+        selected = best[0]
+    return selected, make_filename(selected, "", ".mp4")
+
+
 # ====== PIPELINE ======
 async def process_url(url, status_msg, job_dir, depth=0, referer=None):
     if depth > MAX_DEPTH:
@@ -1035,7 +1219,10 @@ async def run_job(url, status_msg, bot):
     job_dir = os.path.join(DOWNLOAD_DIR, uuid.uuid4().hex[:12])
     os.makedirs(job_dir, exist_ok=True)
     try:
-        path, filename = await process_url(url, status_msg, job_dir)
+        if is_torrent_src(url):
+            path, filename = await process_torrent(url, status_msg, job_dir)
+        else:
+            path, filename = await process_url(url, status_msg, job_dir)
         size = os.path.getsize(path)
         if size > MAX_BYTES:
             raise TooBig(f"file {human_size(size)} > {MAX_SIZE_MB}MB")
@@ -1080,6 +1267,7 @@ async def run_job(url, status_msg, bot):
 
 # ====== HANDLER ======
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+MAGNET_RE = re.compile(r"magnet:\?[^\s<>\"']+", re.I)
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1090,7 +1278,7 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(
-            "Kirim link video (direct / m3u8 / halaman web), bot akan download "
+            "Kirim link video (direct / m3u8 / halaman web / magnet / .torrent), bot akan download "
             f"dan upload ke channel.\nBatas ukuran: {MAX_SIZE_MB}MB.\n/id = lihat ID kamu.")
 
 
@@ -1101,9 +1289,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id not in ALLOWED_USERS:
         await msg.reply_text("Akses ditolak. Kirim /id lalu minta admin menambahkan ID kamu.")
         return
-    m = URL_RE.search(msg.text)
+    m = MAGNET_RE.search(msg.text) or URL_RE.search(msg.text)
     if not m:
-        await msg.reply_text("Kirim link valid (http/https).")
+        await msg.reply_text("Kirim link valid (http/https atau magnet).")
         return
     url = m.group(0).rstrip(").,;")
     status_msg = await msg.reply_text("Memproses...")
@@ -1172,7 +1360,7 @@ def main():
     application.add_error_handler(on_error)
 
     mode = f"Local API {API_HOST}" if API_HOST else "API resmi Telegram (limit ~50MB)"
-    print(f"Bot v4 jalan — {mode} — {NUM_PARTS} paralel (file), {NUM_SEG_PARTS} paralel (HLS).")
+    print(f"Bot v5 jalan — {mode} — {NUM_PARTS} paralel (file), {NUM_SEG_PARTS} paralel (HLS).")
     application.run_polling(poll_interval=2.0, timeout=30, drop_pending_updates=True)
 
 
